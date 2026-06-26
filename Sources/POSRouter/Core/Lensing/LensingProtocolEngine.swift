@@ -34,7 +34,7 @@ final class LensingProtocolEngine {
     }
 
     private func connectNats() async {
-        guard let urlString = natsUrl, let token = natsToken else { return }
+        guard let urlString = natsUrl, let token = natsToken, let code = participantCode else { return }
 
         state = .connecting
 
@@ -46,7 +46,7 @@ final class LensingProtocolEngine {
 
             let client = NatsClientOptions()
                 .url(url)
-                .token(token)
+                .usernameAndPassword(code, token)
                 .build()
 
             client.on(.disconnected) { [weak self] _ in
