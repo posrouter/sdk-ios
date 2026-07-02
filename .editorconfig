@@ -1,0 +1,12 @@
+root = true
+
+[*]
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+
+[*.{swift,md,yml,yaml,gitattributes,gitignore}]
+indent_style = space
+
+[*.md]
+trim_trailing_whitespace = false

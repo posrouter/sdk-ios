@@ -1,0 +1,11 @@
+# LF in repo; line endings enforced by Git (Windows + macOS).
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pdf binary
+*.xcuserstate binary
