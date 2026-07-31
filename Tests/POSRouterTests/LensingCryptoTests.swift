@@ -23,3 +23,4 @@ final class LensingCryptoTests: XCTestCase {
         let actual = LensingCrypto.computeSignature(key: key, timestamp: timestamp)
         XCTAssertEqual(expected, actual)
     }
+}
