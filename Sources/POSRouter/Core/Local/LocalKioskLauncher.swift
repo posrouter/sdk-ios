@@ -19,7 +19,8 @@ enum LocalKioskLauncher {
     static func isAvailable(_ config: POSRouterConfig?) -> Bool {
         #if canImport(UIKit)
         guard let url = URL(string: "\(resolveScheme(config))://\(hostCharge)") else { return false }
-        return UIApplication.shared.canOpenURL(url)
+        // `canOpenURL` is main-thread-only; hop on if a background caller invoked us.
+        return onMainSync { UIApplication.shared.canOpenURL(url) }
         #else
         return false
         #endif

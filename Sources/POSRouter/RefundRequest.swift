@@ -27,8 +27,8 @@ public struct RefundRequest: Sendable {
         self.subMerchantId = subMerchantId
     }
 
-    public static func amountFromDecimal(_ decimal: String) -> Int64 {
-        PaymentRequest.amountFromDecimal(decimal)
+    public static func amountFromDecimal(_ decimal: String) throws -> Int64 {
+        try PaymentRequest.amountFromDecimal(decimal)
     }
 
     func toWire(

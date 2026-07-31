@@ -94,10 +94,19 @@ final class WireFormatTests: XCTestCase {
         XCTAssertTrue(json.contains("\"orderId\":\"O\\\\1\""))
     }
 
-    func testAmountFromDecimal() {
-        XCTAssertEqual(PaymentRequest.amountFromDecimal("66.00"), 6600)
-        XCTAssertEqual(PaymentRequest.amountFromDecimal("12.5"), 1250)
-        XCTAssertEqual(PaymentRequest.amountFromDecimal("0.01"), 1)
+    func testAmountFromDecimal() throws {
+        XCTAssertEqual(try PaymentRequest.amountFromDecimal("66.00"), 6600)
+        XCTAssertEqual(try PaymentRequest.amountFromDecimal("12.5"), 1250)
+        XCTAssertEqual(try PaymentRequest.amountFromDecimal("0.01"), 1)
+    }
+
+    func testAmountFromDecimalRejectsGarbage() {
+        // Unparseable input must throw, not silently become a zero-amount payment.
+        XCTAssertThrowsError(try PaymentRequest.amountFromDecimal("12,50"))
+        XCTAssertThrowsError(try PaymentRequest.amountFromDecimal("abc"))
+        XCTAssertThrowsError(try PaymentRequest.amountFromDecimal(""))
+        // Out-of-range must throw, not clamp.
+        XCTAssertThrowsError(try PaymentRequest.amountFromDecimal("999999999999999999999"))
     }
 
     func testDeepLinkPayUri() {

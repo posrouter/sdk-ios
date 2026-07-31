@@ -41,6 +41,12 @@ final class NatsLensingTransport: LensingTransport {
             .usernameAndPassword(participantCode, token)
             .build()
 
+        // Assign `client` BEFORE registering handlers / calling connect(). nats.swift can fire
+        // `.connected` synchronously during connect(); if the engine subscribes from that callback
+        // while `client` is still nil, the subscribe throws and is swallowed, permanently wedging
+        // result delivery. Making the client visible first closes that window.
+        lock.lock(); self.client = client; lock.unlock()
+
         _ = client.on([.connected]) { [weak self] _ in
             guard let self = self else { return }
             self.lock.lock()
@@ -56,11 +62,20 @@ final class NatsLensingTransport: LensingTransport {
             self.onDisconnected?()
         }
 
-        try await client.connect()
-        lock.lock(); self.client = client; self._isConnected = true; self.everConnected = true; lock.unlock()
+        do {
+            try await client.connect()
+        } catch {
+            // Roll back the optimistic assignment so a failed connect doesn't leave a dead client,
+            // and close it so nats.swift's internal retry loop / event handlers don't linger.
+            lock.lock(); if self.client === client { self.client = nil }; self._isConnected = false; lock.unlock()
+            try? await client.close()
+            throw error
+        }
+        lock.lock(); self._isConnected = true; self.everConnected = true; lock.unlock()
     }
 
     func publish(_ payload: Data, subject: String) async throws {
+        lock.lock(); let client = self.client; lock.unlock()
         guard let client = client else {
             throw LensingException(code: "NOT_CONNECTED", message: "NATS client not connected")
         }
@@ -68,6 +83,7 @@ final class NatsLensingTransport: LensingTransport {
     }
 
     func subscribe(subject: String, handler: @escaping (Data) -> Void) async throws {
+        lock.lock(); let client = self.client; lock.unlock()
         guard let client = client else {
             throw LensingException(code: "NOT_CONNECTED", message: "NATS client not connected")
         }

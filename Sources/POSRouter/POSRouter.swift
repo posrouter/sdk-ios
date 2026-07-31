@@ -17,6 +17,14 @@ public final class POSRouter {
     public func initialize(config: POSRouterConfig) {
         holder.config = config
         holder.routePreference = RoutePreference.auto
+        // Reject a misconfigured scope (blank / dotted / reserved `_` segment) rather than starting
+        // the engine and subscribing on a malformed subject. `assert` flags it in debug builds.
+        do {
+            try LensingSubjects.validate(LensingSubjectScope.fromConfig(config))
+        } catch {
+            assertionFailure("POSRouter.initialize: invalid config scope — \(error)")
+            return
+        }
         engine.start(config)
     }
 
@@ -40,6 +48,8 @@ public final class POSRouter {
         }
         let routing = AcquirerRegistry.shared.resolve(config)
         let preference = holder.routePreference
+
+        guard validateScope(LensingSubjectScope.fromConfig(config), callback) else { return }
 
         if RoutePreferencePolicy.isLocalPosrouterKiosk(preference) {
             if isLocalKioskAvailable() {
@@ -88,6 +98,8 @@ public final class POSRouter {
         let routing = AcquirerRegistry.shared.resolve(config, attemptCode: request.attemptCode)
         let wire = request.toWire(config: config, routing: routing, resolvedAttemptId: resolvedAttemptId)
         let preference = holder.routePreference
+
+        guard validateScope(LensingSubjectScope.fromWire(wire), callback) else { return }
 
         if PaymentClaimRegistry.shared.isClaimed(wire.terminalId, wire.orderId, wire.attemptId) {
             deliver(callback, POSRouterError(code: "ALREADY_CLAIMED", message: "Payment UI already claimed for order \(wire.orderId)"))
@@ -149,6 +161,8 @@ public final class POSRouter {
         let routing = AcquirerRegistry.shared.resolve(config, attemptCode: request.attemptCode)
         let wire = request.toWire(config: config, routing: routing, resolvedAttemptId: resolvedAttemptId)
         let preference = holder.routePreference
+
+        guard validateScope(wire.subjectScope(), callback) else { return }
 
         if !RoutePreferencePolicy.skipsLocalAttempt(preference)
             && RoutePreferencePolicy.shouldTryLocal(preference, acquirerCode: routing.code) {
@@ -339,5 +353,17 @@ public final class POSRouter {
 
     private func deliver(_ callback: POSRouterCallback, _ error: POSRouterError) {
         DispatchQueue.main.async { callback.onError(error) }
+    }
+
+    /// Rejects invalid Lensing subject segments (blank / contains `.` / reserved `_`) with a
+    /// catchable `INVALID_ARGUMENT` error instead of letting them reach subject construction.
+    private func validateScope(_ scope: LensingSubjectScope, _ callback: POSRouterCallback) -> Bool {
+        do {
+            try LensingSubjects.validate(scope)
+            return true
+        } catch {
+            deliver(callback, POSRouterError(code: "INVALID_ARGUMENT", message: "\(error)"))
+            return false
+        }
     }
 }

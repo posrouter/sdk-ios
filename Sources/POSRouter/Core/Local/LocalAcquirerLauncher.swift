@@ -62,12 +62,13 @@ enum LocalAcquirerLauncher {
             return LocalLaunchResult(success: false)
         }
         #if canImport(UIKit)
-        let app = UIApplication.shared
-        guard app.canOpenURL(url) else {
+        // `canOpenURL` and `open` are main-thread-only; hop on if the caller is on a background queue.
+        let canOpen = onMainSync { UIApplication.shared.canOpenURL(url) }
+        guard canOpen else {
             LocalReachabilityCache.shared.markUnreachable(acquirerCode)
             return LocalLaunchResult(success: false)
         }
-        DispatchQueue.main.async { app.open(url, options: [:], completionHandler: nil) }
+        DispatchQueue.main.async { UIApplication.shared.open(url, options: [:], completionHandler: nil) }
         LocalReachabilityCache.shared.markReachable(acquirerCode)
         return LocalLaunchResult(success: true, method: .deepLink)
         #else

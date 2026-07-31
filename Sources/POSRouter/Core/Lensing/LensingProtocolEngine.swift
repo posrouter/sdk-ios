@@ -20,10 +20,12 @@ final class LensingProtocolEngine {
     private let maxBackoffMs: Int64 = 30_000
     private let minBackgroundForReconnectMs: Int64 = 30_000
 
-    private var pendingCredentials: (url: String, token: String, code: String)?
     private var fallbackQueue: [QueuedMessage] = []
     private var ownClaimedEchoKeys: Set<String> = []
-    private var subscribedResultScopes: Set<String> = []
+    /// In-flight/settled subscription per result subject. Concurrent callers for the same scope
+    /// await the SAME task, so no pay is published before its result SUB is on the wire and no
+    /// duplicate subscription is opened. A failed subscribe is dropped so the next attempt retries.
+    private var resultScopeSubs: [String: Task<Bool, Never>] = [:]
 
     private struct QueuedMessage {
         let subject: String
@@ -50,6 +52,40 @@ final class LensingProtocolEngine {
         lock.lock(); transportFactory = factory; lock.unlock()
     }
 
+    /// Test seam: drop the engine straight into a CONNECTED session on `transport`, bypassing the
+    /// live Gateway/NATS handshake, and set up the initiator subscriptions for `config`'s scope.
+    /// Returns once subscriptions are established so tests can assert ordering deterministically.
+    func injectConnectedTransportForTesting(_ transport: LensingTransport, config: POSRouterConfig) async {
+        LensingContextHolder.shared.config = config
+        try? await transport.connect(url: "nats://test", token: "t", participantCode: config.participantCode)
+        lock.lock()
+        activeConfig = config
+        startGeneration += 1
+        self.transport = transport
+        resultScopeSubs.removeAll()
+        fallbackQueue.removeAll()
+        ownClaimedEchoKeys.removeAll()
+        state = .connected
+        lock.unlock()
+        await setupInitiatorSubscriptionsAsync(LensingSubjectScope.fromConfig(config))
+    }
+
+    /// Test seam: return the engine to `.idle` and drop any injected transport.
+    func resetForTesting() {
+        lock.lock()
+        let t = transport
+        transport = nil
+        activeConfig = nil
+        state = .idle
+        startGeneration += 1
+        resultScopeSubs.removeAll()
+        fallbackQueue.removeAll()
+        ownClaimedEchoKeys.removeAll()
+        lock.unlock()
+        t?.close()
+        LensingContextHolder.shared.config = nil
+    }
+
     func currentState() -> LensingState {
         lock.lock(); defer { lock.unlock() }
         return state
@@ -64,7 +100,7 @@ final class LensingProtocolEngine {
         activeConfig = config
         startGeneration += 1
         let generation = startGeneration
-        subscribedResultScopes.removeAll()
+        resultScopeSubs.removeAll()
         lock.unlock()
 
         shutdownConnection()
@@ -105,7 +141,6 @@ final class LensingProtocolEngine {
         setState(.connecting)
 
         lock.lock()
-        pendingCredentials = (credentials.natsUrl, credentials.natsToken, config.participantCode)
         let transport = transportFactory()
         self.transport = transport
         lock.unlock()
@@ -115,8 +150,10 @@ final class LensingProtocolEngine {
             guard let self = self, self.isCurrent(generation) else { return }
             self.lock.lock(); self.reconnectAttempt = 0; self.lock.unlock()
             self.setState(.connected)
-            self.setupInitiatorSubscriptions(scope)
-            self.flushFallbackQueue()
+            Task {
+                await self.setupInitiatorSubscriptionsAsync(scope)
+                self.flushFallbackQueue()
+            }
         }
         transport.onReconnected = { [weak self] in
             guard let self = self, self.isCurrent(generation) else { return }
@@ -135,7 +172,7 @@ final class LensingProtocolEngine {
             // Fire subscriptions + state even if the transport didn't emit `.connected` synchronously.
             setState(.connected)
             lock.lock(); reconnectAttempt = 0; lock.unlock()
-            setupInitiatorSubscriptions(scope)
+            await setupInitiatorSubscriptionsAsync(scope)
             flushFallbackQueue()
         } catch {
             guard isCurrent(generation) else { return }
@@ -161,14 +198,18 @@ final class LensingProtocolEngine {
     }
 
     func refreshConnectionIfNeeded(force: Bool = false, backgroundMs: Int64 = 0) {
-        guard let config = activeConfig ?? LensingContextHolder.shared.config else { return }
+        lock.lock(); let cfg = activeConfig; lock.unlock()
+        guard let config = cfg ?? LensingContextHolder.shared.config else { return }
         if !force && !shouldRefreshConnection(backgroundMs: backgroundMs) { return }
         start(config, force: true)
     }
 
     private func shouldRefreshConnection(backgroundMs: Int64) -> Bool {
-        let s = currentState()
-        if s == .connected && transport?.isConnected != true { return true }
+        lock.lock()
+        let s = state
+        let socketAlive = transport?.isConnected == true
+        lock.unlock()
+        if s == .connected && !socketAlive { return true }
         if s == .failed { return true }
         if backgroundMs >= minBackgroundForReconnectMs && s != .connected { return true }
         return false
@@ -191,48 +232,58 @@ final class LensingProtocolEngine {
         lock.lock()
         let t = transport
         transport = nil
-        subscribedResultScopes.removeAll()
+        resultScopeSubs.removeAll()
         lock.unlock()
         t?.close()
     }
 
     // MARK: - Subscriptions
 
-    private func setupInitiatorSubscriptions(_ scope: LensingSubjectScope) {
-        guard let transport = self.transport else { return }
-        let resultKey = LensingSubjects.resultSubject(scope)
-        lock.lock()
-        let alreadySubscribed = subscribedResultScopes.contains(resultKey)
-        if !alreadySubscribed { subscribedResultScopes.insert(resultKey) }
-        lock.unlock()
-        guard !alreadySubscribed else { return }
-
-        subscribe(transport, LensingSubjects.claimedSubject(scope)) { [weak self] data in
-            self?.handleIncomingClaimed(data)
-        }
-        subscribe(transport, LensingSubjects.resultSubject(scope)) { [weak self] data in
-            self?.handleIncomingResult(data)
-        }
-        subscribe(transport, LensingSubjects.voidSubject(scope)) { [weak self] data in
-            self?.handleIncomingVoid(data)
+    /// Establishes the initiator's `.claimed` / `.result` / `.void` subscriptions and only returns
+    /// once the transport has accepted them. Deduped and serialized per result subject via
+    /// ``ensureResultScopeSubscribed(_:subscribe:)``.
+    @discardableResult
+    private func setupInitiatorSubscriptionsAsync(_ scope: LensingSubjectScope) async -> Bool {
+        await ensureResultScopeSubscribed(LensingSubjects.resultSubject(scope)) { [weak self] transport in
+            guard let self = self else { return false }
+            let ok1 = await self.subscribeAsync(transport, LensingSubjects.claimedSubject(scope)) { [weak self] d in self?.handleIncomingClaimed(d) }
+            let ok2 = await self.subscribeAsync(transport, LensingSubjects.resultSubject(scope)) { [weak self] d in self?.handleIncomingResult(d) }
+            let ok3 = await self.subscribeAsync(transport, LensingSubjects.voidSubject(scope)) { [weak self] d in self?.handleIncomingVoid(d) }
+            return ok1 && ok2 && ok3
         }
     }
 
-    /// Initiator must listen on the pay wire namespace (V1.6 subject) for the remote `.result`.
-    private func ensureSubscriptionsForWire(_ wire: WirePaymentRequest) {
-        let scope = LensingSubjectScope.fromWire(wire)
-        let key = LensingSubjects.resultSubject(scope)
-        lock.lock()
-        if subscribedResultScopes.contains(key) { lock.unlock(); return }
-        subscribedResultScopes.insert(key)
-        let transport = self.transport
-        lock.unlock()
-        guard let transport = transport else { return }
-        subscribe(transport, key) { [weak self] data in self?.handleIncomingResult(data) }
+    /// Initiator must listen on the pay wire namespace (V1.6 subject) for the remote `.result`
+    /// BEFORE the pay is published, otherwise a fast terminal's result can race ahead of the SUB
+    /// and be missed. Returns `true` once the subscription is accepted (or already active).
+    @discardableResult
+    private func ensureSubscriptionsForWireAsync(_ wire: WirePaymentRequest) async -> Bool {
+        let key = LensingSubjects.resultSubject(LensingSubjectScope.fromWire(wire))
+        return await ensureResultScopeSubscribed(key) { [weak self] transport in
+            await self?.subscribeAsync(transport, key) { [weak self] d in self?.handleIncomingResult(d) } ?? false
+        }
     }
 
-    private func subscribe(_ transport: LensingTransport, _ subject: String, _ handler: @escaping (Data) -> Void) {
-        Task { try? await transport.subscribe(subject: subject) { data in handler(data) } }
+    /// Serializes subscription setup per result subject: the first caller runs `subscribe`, any
+    /// concurrent caller awaits the same task, and a failed attempt is dropped so a later pay /
+    /// reconnect retries instead of silently publishing with no listener.
+    private func ensureResultScopeSubscribed(_ key: String, subscribe: @escaping (LensingTransport) async -> Bool) async -> Bool {
+        lock.lock()
+        if let existing = resultScopeSubs[key] { lock.unlock(); return await existing.value }
+        guard let transport = self.transport else { lock.unlock(); return false }
+        let task = Task { await subscribe(transport) }
+        resultScopeSubs[key] = task
+        lock.unlock()
+
+        let ok = await task.value
+        if !ok { lock.lock(); if resultScopeSubs[key] != nil { resultScopeSubs[key] = nil }; lock.unlock() }
+        return ok
+    }
+
+    @discardableResult
+    private func subscribeAsync(_ transport: LensingTransport, _ subject: String, _ handler: @escaping (Data) -> Void) async -> Bool {
+        do { try await transport.subscribe(subject: subject) { data in handler(data) }; return true }
+        catch { return false }
     }
 
     // MARK: - Inbound
@@ -294,9 +345,19 @@ final class LensingProtocolEngine {
         }
 
         PaymentAttemptRegistry.shared.store(request, callback: callback)
-        ensureSubscriptionsForWire(request)
 
         Task {
+            // Subscribe to the result subject BEFORE publishing the pay, so a fast terminal's
+            // result cannot arrive before our SUB is on the wire. If the subscribe fails, do NOT
+            // publish blind (the pay would go out with no result listener and hang) — queue and
+            // surface an error so the next connected attempt retries with a live subscription.
+            let subscribed = await self.ensureSubscriptionsForWireAsync(request)
+            guard subscribed else {
+                PaymentAttemptRegistry.shared.close(request.terminalId, request.orderId, request.attemptId)
+                self.lock.lock(); self.fallbackQueue.append(QueuedMessage(subject: subject, payload: payload, request: request, callback: callback)); self.lock.unlock()
+                self.deliverError(callback, POSRouterError(code: "PUBLISH_FAILED", message: "Result subscription failed"))
+                return
+            }
             do {
                 try await transport.publish(payload, subject: subject)
             } catch {
@@ -352,6 +413,8 @@ final class LensingProtocolEngine {
 
     func publishPaymentResult(_ result: PaymentResult) {
         guard let scope = resolveResultScope(result) else { return }
+        // Result data can originate from an external callback; don't publish on a malformed subject.
+        guard (try? LensingSubjects.validate(scope)) != nil else { return }
         publishToSubject(LensingSubjects.resultSubject(scope), result.toJsonString())
     }
 
@@ -391,8 +454,8 @@ final class LensingProtocolEngine {
 
         for queued in pending {
             PaymentAttemptRegistry.shared.store(queued.request, callback: queued.callback)
-            ensureSubscriptionsForWire(queued.request)
             Task {
+                await self.ensureSubscriptionsForWireAsync(queued.request)
                 do {
                     try await transport.publish(queued.payload, subject: queued.subject)
                 } catch {

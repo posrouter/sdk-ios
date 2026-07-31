@@ -48,15 +48,38 @@ public struct PaymentRequest: Sendable {
         return method.caseInsensitiveCompare(methodSelection) == .orderedSame
     }
 
+    public enum AmountError: Error, CustomStringConvertible {
+        case invalidDecimal(String)
+        case overflow(String)
+        public var description: String {
+            switch self {
+            case .invalidDecimal(let s): return "amount is not a valid decimal: \"\(s)\""
+            case .overflow(let s): return "amount is out of range: \"\(s)\""
+            }
+        }
+    }
+
     /// Parse a decimal amount string (e.g. `"66.00"`) into smallest currency units (cents).
-    public static func amountFromDecimal(_ decimal: String) -> Int64 {
-        guard let value = Decimal(string: decimal) else { return 0 }
+    /// Throws on unparseable input or values outside `Int64` range instead of silently yielding 0
+    /// (a zero-amount payment) or a clamped total. The whole string must be a valid decimal — a
+    /// partial parse like `"12,50"` (which `Decimal(string:)` would truncate to `12`) is rejected.
+    public static func amountFromDecimal(_ decimal: String) throws -> Int64 {
+        let scanner = Scanner(string: decimal)
+        scanner.locale = Locale(identifier: "en_US_POSIX")
+        guard let value = scanner.scanDecimal(), scanner.isAtEnd,
+              NSDecimalNumber(decimal: value) != .notANumber else {
+            throw AmountError.invalidDecimal(decimal)
+        }
         let cents = NSDecimalNumber(decimal: value)
             .multiplying(by: 100)
             .rounding(accordingToBehavior: NSDecimalNumberHandler(
                 roundingMode: .plain, scale: 0,
                 raiseOnExactness: false, raiseOnOverflow: false,
                 raiseOnUnderflow: false, raiseOnDivideByZero: false))
+        guard cents.compare(NSDecimalNumber(value: Int64.max)) != .orderedDescending,
+              cents.compare(NSDecimalNumber(value: Int64.min)) != .orderedAscending else {
+            throw AmountError.overflow(decimal)
+        }
         return cents.int64Value
     }
 
