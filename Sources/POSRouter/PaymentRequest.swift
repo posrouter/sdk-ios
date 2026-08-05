@@ -70,12 +70,16 @@ public struct PaymentRequest: Sendable {
               NSDecimalNumber(decimal: value) != .notANumber else {
             throw AmountError.invalidDecimal(decimal)
         }
-        let cents = NSDecimalNumber(decimal: value)
-            .multiplying(by: 100)
-            .rounding(accordingToBehavior: NSDecimalNumberHandler(
-                roundingMode: .plain, scale: 0,
-                raiseOnExactness: false, raiseOnOverflow: false,
-                raiseOnUnderflow: false, raiseOnDivideByZero: false))
+        let scaled = NSDecimalNumber(decimal: value).multiplying(by: 100)
+        let cents = scaled.rounding(accordingToBehavior: NSDecimalNumberHandler(
+            roundingMode: .plain, scale: 0,
+            raiseOnExactness: false, raiseOnOverflow: false,
+            raiseOnUnderflow: false, raiseOnDivideByZero: false))
+        // Reject sub-cent precision (e.g. "1.005") rather than silently rounding it —
+        // the docstring promises an exact decimal, and a rounded amount masks a units bug.
+        guard cents.compare(scaled) == .orderedSame else {
+            throw AmountError.invalidDecimal(decimal)
+        }
         guard cents.compare(NSDecimalNumber(value: Int64.max)) != .orderedDescending,
               cents.compare(NSDecimalNumber(value: Int64.min)) != .orderedAscending else {
             throw AmountError.overflow(decimal)

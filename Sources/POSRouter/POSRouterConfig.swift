@@ -59,8 +59,10 @@ public struct POSRouterConfig: Sendable, Equatable {
         gatewayBaseUrl: String? = nil,
         localKioskScheme: String? = nil
     ) {
-        self.participantCode = participantCode
-        self.participantKey = participantKey
+        // Trim: a stray trailing newline on a pasted key/code breaks the /init HMAC
+        // signature and surfaces only as an opaque GATEWAY_ERROR 401.
+        self.participantCode = participantCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.participantKey = participantKey.trimmingCharacters(in: .whitespacesAndNewlines)
         self.terminalId = terminalId
         self.acquirerCode = acquirerCode
         self.merchantId = merchantId

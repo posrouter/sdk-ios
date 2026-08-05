@@ -94,6 +94,7 @@ public final class POSRouter {
             deliver(callback, POSRouterError(code: "NOT_INITIALIZED", message: "Call initialize(config:) first"))
             return
         }
+        guard validateTxn(orderId: request.orderId, amount: request.amount, callback) else { return }
         let resolvedAttemptId = PaymentAttemptIdResolver.shared.resolve(orderId: request.orderId, explicit: request.attemptId)
         let routing = AcquirerRegistry.shared.resolve(config, attemptCode: request.attemptCode)
         let wire = request.toWire(config: config, routing: routing, resolvedAttemptId: resolvedAttemptId)
@@ -157,6 +158,7 @@ public final class POSRouter {
             deliver(callback, POSRouterError(code: "NOT_INITIALIZED", message: "Call initialize(config:) first"))
             return
         }
+        guard validateTxn(orderId: request.orderId, amount: request.amount, callback) else { return }
         let resolvedAttemptId = RefundAttemptIdResolver.resolve(orderId: request.orderId, attemptId: request.attemptId)
         let routing = AcquirerRegistry.shared.resolve(config, attemptCode: request.attemptCode)
         let wire = request.toWire(config: config, routing: routing, resolvedAttemptId: resolvedAttemptId)
@@ -365,5 +367,20 @@ public final class POSRouter {
             deliver(callback, POSRouterError(code: "INVALID_ARGUMENT", message: "\(error)"))
             return false
         }
+    }
+
+    /// Rejects money-moving requests before any wire payload is built. A blank `orderId` would
+    /// otherwise reach the terminal with a garbage `attemptId` (`"#1"` / `"#refund"`), and a
+    /// non-positive `amount` would publish `amount:0`/negative to a live terminal.
+    private func validateTxn(orderId: String, amount: Int64, _ callback: POSRouterCallback) -> Bool {
+        if orderId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            deliver(callback, POSRouterError(code: "INVALID_ARGUMENT", message: "orderId must not be blank"))
+            return false
+        }
+        if amount <= 0 {
+            deliver(callback, POSRouterError(code: "INVALID_ARGUMENT", message: "amount must be a positive integer in minor units (cents)"))
+            return false
+        }
+        return true
     }
 }

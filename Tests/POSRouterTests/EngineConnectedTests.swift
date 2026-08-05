@@ -66,6 +66,66 @@ final class EngineConnectedTests: XCTestCase {
         XCTAssertLessThan(subIdx, lastPubIdx, "result SUB must precede BOTH pay PUBs; events=\(transport.events)")
     }
 
+    /// A refund whose scope differs from the connect-time config scope (here terminal T2 vs config
+    /// T1 — the same shape an `attemptCode` routing override produces) must SUBSCRIBE its `.result`
+    /// before PUBLISHING the refund, otherwise the terminal's refund result lands on an unsubscribed
+    /// subject and is lost. (Fable cross-check, Medium.)
+    func testRefundResultSubscribedBeforePublish() async throws {
+        let transport = RecordingTransport()
+        let config = POSRouterConfig(participantCode: "G", participantKey: "k", terminalId: "T1",
+                                     acquirerCode: "SUPY", merchantId: "m")
+        await engine.injectConnectedTransportForTesting(transport, config: config)
+
+        let wire = RefundRequest(terminalId: "T2", orderId: "RFA", amount: 500)
+            .toWire(config: config, routing: AcquirerRegistry.shared.resolve(config), resolvedAttemptId: "RFA#refund")
+        engine.dispatchRefund(wire, callback: NoopCallback())
+
+        let refundSubject = "lensing.SUPY.m._.T2.refund"
+        let resultSubject = "lensing.SUPY.m._.T2.result"
+        await waitFor { transport.index(of: "pub:\(refundSubject)") != nil }
+
+        guard let subIdx = transport.index(of: "sub:\(resultSubject)"),
+              let pubIdx = transport.index(of: "pub:\(refundSubject)") else {
+            return XCTFail("expected a result subscribe and a refund publish; got \(transport.events)")
+        }
+        XCTAssertLessThan(subIdx, pubIdx, "result SUB must precede refund PUB; events=\(transport.events)")
+    }
+
+    /// A blank orderId or a non-positive amount must be rejected with INVALID_ARGUMENT before
+    /// anything is published — the wire would otherwise carry attemptId "#1" / amount<=0 to a live
+    /// terminal. Covers both pay and refund. (Fable cross-check, High.)
+    func testPayRejectsBlankOrderIdAndBadAmount() async throws {
+        let transport = RecordingTransport()
+        let config = POSRouterConfig(participantCode: "G", participantKey: "k", terminalId: "T1",
+                                     acquirerCode: "SUPY", merchantId: "m")
+        await engine.injectConnectedTransportForTesting(transport, config: config)
+
+        for (order, amount) in [("   ", Int64(6600)), ("OK", Int64(0)), ("OK", Int64(-5))] {
+            let exp = expectation(description: "onError \(order)/\(amount)")
+            let cb = ErrorCallback { err in XCTAssertEqual(err.code, "INVALID_ARGUMENT"); exp.fulfill() }
+            POSRouter.shared.pay(request: PaymentRequest(terminalId: "T1", amount: amount, orderId: order), callback: cb)
+            await fulfillment(of: [exp], timeout: 2)
+        }
+        XCTAssertTrue(transport.events.filter { $0.hasPrefix("pub:") }.isEmpty,
+                      "no pay may reach the wire; events=\(transport.events)")
+    }
+
+    func testRefundRejectsBlankOrderIdAndBadAmount() async throws {
+        let transport = RecordingTransport()
+        let config = POSRouterConfig(participantCode: "G", participantKey: "k", terminalId: "T1",
+                                     acquirerCode: "SUPY", merchantId: "m")
+        await engine.injectConnectedTransportForTesting(transport, config: config)
+
+        for (order, amount) in [("", Int64(500)), ("OK", Int64(0))] {
+            let exp = expectation(description: "refund onError \(order)/\(amount)")
+            let cb = ErrorCallback { err in XCTAssertEqual(err.code, "INVALID_ARGUMENT"); exp.fulfill() }
+            POSRouter.shared.refund(request: RefundRequest(terminalId: "T1", orderId: order, amount: amount), callback: cb)
+            await fulfillment(of: [exp], timeout: 2)
+        }
+        XCTAssertTrue(transport.events.filter { $0.hasPrefix("pub:") }.isEmpty,
+                      "no refund may reach the wire; events=\(transport.events)")
+    }
+
     /// A result arriving on the subscribed `.result` subject must be delivered to the pending
     /// `pay` callback. Exercises subscribe → inbound JSON parse → dispatcher → callback.
     func testInboundResultDeliversCallback() async throws {
@@ -138,6 +198,13 @@ final class ResultCallback: POSRouterCallback {
     init(_ handler: @escaping (PaymentResult) -> Void) { onResultHandler = handler }
     func onResult(_ result: PaymentResult) { onResultHandler(result) }
     func onError(_ error: POSRouterError) {}
+}
+
+final class ErrorCallback: POSRouterCallback {
+    private let onErrorHandler: (POSRouterError) -> Void
+    init(_ handler: @escaping (POSRouterError) -> Void) { onErrorHandler = handler }
+    func onResult(_ result: PaymentResult) {}
+    func onError(_ error: POSRouterError) { onErrorHandler(error) }
 }
 
 extension XCTestCase {

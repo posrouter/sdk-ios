@@ -258,7 +258,16 @@ final class LensingProtocolEngine {
     /// and be missed. Returns `true` once the subscription is accepted (or already active).
     @discardableResult
     private func ensureSubscriptionsForWireAsync(_ wire: WirePaymentRequest) async -> Bool {
-        let key = LensingSubjects.resultSubject(LensingSubjectScope.fromWire(wire))
+        await ensureResultSubscribedForScope(LensingSubjectScope.fromWire(wire))
+    }
+
+    /// Subscribe the `.result` subject for an arbitrary scope before publishing to it. Used by pay
+    /// (via the wire scope) and refund (whose scope can differ from the config scope when an
+    /// `attemptCode` routing override changes the acquirer code) so a refund result on an
+    /// unsubscribed scope isn't silently lost.
+    @discardableResult
+    private func ensureResultSubscribedForScope(_ scope: LensingSubjectScope) async -> Bool {
+        let key = LensingSubjects.resultSubject(scope)
         return await ensureResultScopeSubscribed(key) { [weak self] transport in
             await self?.subscribeAsync(transport, key) { [weak self] d in self?.handleIncomingResult(d) } ?? false
         }
@@ -389,6 +398,15 @@ final class LensingProtocolEngine {
 
         RefundAttemptRegistry.shared.store(request, callback: callback)
         Task {
+            // Subscribe the refund's own `.result` scope BEFORE publishing — with an attemptCode
+            // routing override this scope can differ from the connect-time config scope, so without
+            // this the terminal's refund result arrives on a subject nobody is listening on.
+            let subscribed = await self.ensureResultSubscribedForScope(request.subjectScope())
+            guard subscribed else {
+                RefundAttemptRegistry.shared.close(request)
+                self.deliverError(callback, POSRouterError(code: "PUBLISH_FAILED", message: "Refund result subscription failed"))
+                return
+            }
             do {
                 try await transport.publish(payload, subject: subject)
             } catch {

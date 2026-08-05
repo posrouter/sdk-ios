@@ -107,6 +107,9 @@ final class WireFormatTests: XCTestCase {
         XCTAssertThrowsError(try PaymentRequest.amountFromDecimal(""))
         // Out-of-range must throw, not clamp.
         XCTAssertThrowsError(try PaymentRequest.amountFromDecimal("999999999999999999999"))
+        // Sub-cent precision must throw, not silently round (a units bug in disguise).
+        XCTAssertThrowsError(try PaymentRequest.amountFromDecimal("1.005"))
+        XCTAssertThrowsError(try PaymentRequest.amountFromDecimal("0.001"))
     }
 
     func testDeepLinkPayUri() {
