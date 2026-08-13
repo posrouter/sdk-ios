@@ -4,7 +4,10 @@ import PackageDescription
 let package = Package(
     name: "POSRouter",
     platforms: [
-        .iOS(.v15)
+        .iOS(.v15),
+        // macOS is supported only to allow `swift build` / `swift test` on a developer Mac
+        // (the Nats dependency requires macOS 13+); the SDK ships for iOS.
+        .macOS(.v13)
     ],
     products: [
         .library(
@@ -13,7 +16,7 @@ let package = Package(
         )
     ],
     dependencies: [
-        .package(name: "Nats", url: "https://github.com/nats-io/nats.swift.git", from: "0.1.0")
+        .package(name: "Nats", url: "https://github.com/nats-io/nats.swift.git", from: "0.4.0")
     ],
     targets: [
         .target(
